@@ -26,10 +26,13 @@ impl Default for GraphConfig {
 
 type PlotRun = Vec<[f64; 2]>;
 
-/// Split a sample series into measurement runs and overload runs.
+/// Upper bound on points drawn per frame; larger windows are min/max decimated.
+const MAX_DRAW_POINTS: usize = 6000;
+
+/// Split samples into measurement runs and overload runs.
 /// OL points use the last (or first) valid Y so they stay in axis range; they
 /// are never NaN (egui panics on NaN paths).
-fn split_meas_and_ol(ys: &[f64], mode: MeterMode) -> (Vec<PlotRun>, Vec<PlotRun>) {
+fn split_meas_and_ol(xs: &[f64], ys: &[f64], mode: MeterMode) -> (Vec<PlotRun>, Vec<PlotRun>) {
     let fallback = ys
         .iter()
         .copied()
@@ -40,8 +43,7 @@ fn split_meas_and_ol(ys: &[f64], mode: MeterMode) -> (Vec<PlotRun>, Vec<PlotRun>
     let mut meas: PlotRun = Vec::new();
     let mut ol: PlotRun = Vec::new();
     let mut last_valid = fallback;
-    for (i, &y) in ys.iter().enumerate() {
-        let x = i as f64;
+    for (&x, &y) in xs.iter().zip(ys) {
         if !y.is_finite() {
             if !meas.is_empty() {
                 meas_runs.push(std::mem::take(&mut meas));
@@ -73,18 +75,305 @@ fn split_meas_and_ol(ys: &[f64], mode: MeterMode) -> (Vec<PlotRun>, Vec<PlotRun>
 
 /// One screen-space segment per OL run so dash length is even in pixels.
 /// Per-sample vertices would restart the dash pattern on serial jitter.
-fn flatten_ol_run(run: &[[f64; 2]]) -> PlotRun {
+fn flatten_ol_run(run: &[[f64; 2]], half_gap: f64) -> PlotRun {
     match run {
         [] => Vec::new(),
-        [p] => vec![[p[0] - 0.4, p[1]], [p[0] + 0.4, p[1]]],
+        [p] => vec![[p[0] - half_gap, p[1]], [p[0] + half_gap, p[1]]],
         [first, .., last] => vec![*first, *last],
     }
+}
+
+/// View state of the DMM line graph. Not persisted: times restart with the app.
+#[derive(Debug)]
+pub struct GraphView {
+    /// Right edge tracks the newest sample.
+    pub follow: bool,
+    /// Visible time window, seconds.
+    pub x_span: f64,
+    /// Left edge when not following.
+    pub x_min: f64,
+    /// Y range tracks the visible data.
+    pub auto_y: bool,
+    pub y_min: f64,
+    pub y_max: f64,
+    /// Auto Y has been fitted to data at least once (first fit jumps, later ones ease).
+    y_seeded: bool,
+    /// Result of the last save, shown next to the buttons.
+    pub status: String,
+    /// Pending background save; resolves to a status message.
+    save_rx: Option<std::sync::mpsc::Receiver<String>>,
+}
+
+impl Default for GraphView {
+    fn default() -> Self {
+        Self {
+            follow: true,
+            x_span: 30.0,
+            x_min: 0.0,
+            auto_y: true,
+            y_min: -1.0,
+            y_max: 1.0,
+            y_seeded: false,
+            status: String::new(),
+            save_rx: None,
+        }
+    }
+}
+
+impl GraphView {
+    fn zoom_x(&mut self, factor: f64) {
+        let span = (self.x_span * factor).clamp(1e-3, 1e8);
+        if !self.follow {
+            self.x_min += (self.x_span - span) / 2.0;
+        }
+        self.x_span = span;
+    }
+
+    fn zoom_y(&mut self, factor: f64) {
+        let centre = (self.y_min + self.y_max) / 2.0;
+        let half = ((self.y_max - self.y_min) / 2.0 * factor).max(1e-12);
+        self.auto_y = false;
+        self.y_min = centre - half;
+        self.y_max = centre + half;
+    }
+}
+
+/// Newest-aligned view of the time and value buffers (the value buffer can be
+/// longer, e.g. after a PSU session; the tail always pairs up).
+struct Series<'a> {
+    times: &'a VecDeque<f64>,
+    values: &'a VecDeque<f64>,
+    off_t: usize,
+    off_v: usize,
+    len: usize,
+}
+
+impl<'a> Series<'a> {
+    fn new(times: &'a VecDeque<f64>, values: &'a VecDeque<f64>) -> Self {
+        let len = times.len().min(values.len());
+        Self {
+            times,
+            values,
+            off_t: times.len() - len,
+            off_v: values.len() - len,
+            len,
+        }
+    }
+
+    fn t(&self, i: usize) -> f64 {
+        self.times[self.off_t + i]
+    }
+
+    fn v(&self, i: usize) -> f64 {
+        self.values[self.off_v + i]
+    }
+
+    /// Sample index range covering `[lo, hi]`, padded by one sample each side.
+    fn window(&self, lo: f64, hi: f64) -> (usize, usize) {
+        let first = self
+            .times
+            .partition_point(|&t| t < lo)
+            .saturating_sub(self.off_t)
+            .saturating_sub(1);
+        let last = (self
+            .times
+            .partition_point(|&t| t <= hi)
+            .saturating_sub(self.off_t)
+            + 1)
+        .min(self.len);
+        (first.min(last), last)
+    }
+
+    /// Samples in `[i0, i1)`. When there are more than `max_points`, each
+    /// `bucket_dt`-second bucket keeps its min, max and first overload sample.
+    /// Buckets are aligned to absolute time so the trace does not shimmer as
+    /// the window slides.
+    fn decimated(
+        &self,
+        i0: usize,
+        i1: usize,
+        mode: MeterMode,
+        max_points: usize,
+        bucket_dt: f64,
+    ) -> (Vec<f64>, Vec<f64>) {
+        let mut xs = Vec::new();
+        let mut ys = Vec::new();
+        if i1 - i0 <= max_points || bucket_dt <= 0.0 {
+            for i in i0..i1 {
+                xs.push(self.t(i));
+                ys.push(self.v(i));
+            }
+            return (xs, ys);
+        }
+        let mut flush = |picks: &mut [Option<usize>; 3]| {
+            let mut idx: Vec<usize> = picks.iter().flatten().copied().collect();
+            idx.sort_unstable();
+            idx.dedup();
+            for i in idx {
+                xs.push(self.t(i));
+                ys.push(self.v(i));
+            }
+            *picks = [None; 3];
+        };
+        // [min, max, first overload] of the current bucket
+        let mut picks: [Option<usize>; 3] = [None; 3];
+        let mut key = i64::MIN;
+        for i in i0..i1 {
+            let k = (self.t(i) / bucket_dt).floor() as i64;
+            if k != key {
+                flush(&mut picks);
+                key = k;
+            }
+            let y = self.v(i);
+            if !y.is_finite() || is_meter_overload(y, mode) {
+                picks[2].get_or_insert(i);
+                continue;
+            }
+            if picks[0].is_none_or(|j| y < self.v(j)) {
+                picks[0] = Some(i);
+            }
+            if picks[1].is_none_or(|j| y > self.v(j)) {
+                picks[1] = Some(i);
+            }
+        }
+        flush(&mut picks);
+        (xs, ys)
+    }
+}
+
+/// Round up to 1, 2 or 5 times a power of ten.
+fn nice_step(x: f64) -> f64 {
+    if !(x.is_finite() && x > 0.0) {
+        return 0.0;
+    }
+    let mag = 10f64.powf(x.log10().floor());
+    [1.0, 2.0, 5.0, 10.0]
+        .into_iter()
+        .map(|m| m * mag)
+        .find(|s| *s >= x)
+        .unwrap_or(10.0 * mag)
+}
+
+/// Padded min/max of the plottable values, or `None` when there are none.
+fn auto_y_range(ys: &[f64], mode: MeterMode) -> Option<(f64, f64)> {
+    let (lo, hi) = ys
+        .iter()
+        .copied()
+        .filter(|y| y.is_finite() && !is_meter_overload(*y, mode))
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), y| {
+            (lo.min(y), hi.max(y))
+        });
+    if lo > hi {
+        return None;
+    }
+    // Padded, and never thinner than 0.2 % of the level (or 1e-6), so meter noise
+    // on a steady signal is not blown up to full height.
+    let centre = (lo + hi) / 2.0;
+    let half = ((hi - lo) * 0.55).max(centre.abs() * 0.001).max(5e-7);
+    Some((centre - half, centre + half))
+}
+
+/// Clock time for an axis tick, with the precision the visible span needs.
+fn format_clock(t: f64, wall0: f64, span: f64) -> String {
+    use chrono::TimeZone;
+    let ms = ((wall0 + t) * 1000.0).round() as i64;
+    let Some(dt) = chrono::Local.timestamp_millis_opt(ms).single() else {
+        return format!("{t:.1}");
+    };
+    let clock = dt.format("%H:%M:%S").to_string();
+    let millis = ms.rem_euclid(1000);
+    if span < 2.0 {
+        format!("{clock}.{millis:03}")
+    } else if span < 20.0 {
+        format!("{clock}.{}", millis / 100)
+    } else {
+        clock
+    }
+}
+
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// Write `(time, value)` rows as CSV. Returns the number of rows written.
+#[cfg(not(target_arch = "wasm32"))]
+fn save_graph_csv(
+    path: &std::path::Path,
+    rows: &[(f64, f64)],
+    unit: &str,
+    mode: MeterMode,
+    wall0: f64,
+) -> Result<usize, String> {
+    let mut writer = csv::WriterBuilder::new()
+        .from_path(path)
+        .map_err(|e| e.to_string())?;
+    writer
+        .write_record(["timestamp", "seconds", "value", "unit"])
+        .map_err(|e| e.to_string())?;
+    for &(t, y) in rows {
+        let stamp = chrono::DateTime::from_timestamp_millis(((wall0 + t) * 1000.0).round() as i64)
+            .map(|d| d.to_rfc3339())
+            .unwrap_or_default();
+        let value = if is_meter_overload(y, mode) {
+            "OL".to_owned()
+        } else {
+            y.to_string()
+        };
+        writer
+            .write_record([stamp, format!("{t:.3}"), value, unit.to_owned()])
+            .map_err(|e| e.to_string())?;
+    }
+    writer.flush().map_err(|e| e.to_string())?;
+    Ok(rows.len())
+}
+
+/// Ask for a path and write the rows off the UI thread, so sampling and
+/// repaint carry on while the dialog is open. The receiver gets a status line
+/// (empty when the dialog was cancelled).
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_csv_save(
+    ctx: egui::Context,
+    rows: Vec<(f64, f64)>,
+    unit: String,
+    mode: MeterMode,
+    wall0: f64,
+) -> std::sync::mpsc::Receiver<String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    tokio::spawn(async move {
+        let picked = rfd::AsyncFileDialog::new()
+            .add_filter("CSV", &["csv"])
+            .set_file_name("graph.csv")
+            .save_file()
+            .await;
+        let msg = match picked {
+            None => String::new(),
+            Some(file) => {
+                let path = file.path().to_path_buf();
+                let done = tokio::task::spawn_blocking(move || {
+                    save_graph_csv(&path, &rows, &unit, mode, wall0)
+                })
+                .await;
+                match done {
+                    Ok(Ok(n)) => format!("Saved {n} samples"),
+                    Ok(Err(e)) => format!("Save failed: {e}"),
+                    Err(e) => format!("Save failed: {e}"),
+                }
+            }
+        };
+        let _ = tx.send(msg);
+        ctx.request_repaint();
+    });
+    rx
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn show_line_graph(
     ui: &mut egui::Ui,
     values: &mut VecDeque<f64>,
+    times: &mut VecDeque<f64>,
+    view: &mut GraphView,
     reverse_graph: bool,
     graph_line_color: Color32,
     mem_depth: &mut usize,
@@ -95,53 +384,273 @@ pub fn show_line_graph(
     curr_unit: &str,
     metermode: MeterMode,
 ) {
-    let mut ys: Vec<f64> = values.iter().copied().collect();
-    if reverse_graph {
-        ys.reverse();
+    // Prefixed unit text uses the mode's base unit; `curr_unit` can already carry a prefix.
+    let base_unit: String = if metermode == MeterMode::Temp && !curr_unit.is_empty() {
+        curr_unit.to_owned()
+    } else {
+        metermode.default_unit().to_owned()
+    };
+    let si = crate::helpers::mode_takes_si_prefix(&metermode);
+    if let Some(rx) = &view.save_rx
+        && let Ok(msg) = rx.try_recv()
+    {
+        view.status = msg;
+        view.save_rx = None;
     }
-    let (meas_runs, ol_runs) = split_meas_and_ol(&ys, metermode);
-    let plot = Plot::new("graph")
-        .legend(Legend::default().text_style(egui::TextStyle::Monospace))
-        .y_axis_min_width(4.0)
-        .y_axis_label(curr_unit)
-        .x_axis_label("Samples")
-        .show_axes(true)
-        .show_grid(true);
+    let (now, dt) = ui.ctx().input(|i| (i.time, f64::from(i.stable_dt)));
+    let wall0 = unix_now() - now;
 
+    let series = Series::new(times, values);
+    let t_last = if series.len > 0 {
+        series.t(series.len - 1)
+    } else {
+        0.0
+    };
+    let t_first = if series.len > 0 { series.t(0) } else { 0.0 };
+    if series.len == 0 {
+        view.y_seeded = false;
+    }
+
+    // Window to draw. Following tracks the clock so it scrolls smoothly.
+    let span = view.x_span.max(1e-3);
+    let (x_lo, x_hi) = if view.follow {
+        (now - span * 0.99, now + span * 0.01)
+    } else {
+        (view.x_min, view.x_min + span)
+    };
+    let (i0, i1) = series.window(x_lo, x_hi);
+    let bucket_dt = nice_step(span / (MAX_DRAW_POINTS / 3) as f64);
+    let (xs, ys) = series.decimated(i0, i1, metermode, MAX_DRAW_POINTS, bucket_dt);
+
+    // Y range: auto eases towards the data (grows at once, shrinks gradually).
+    if view.auto_y
+        && let Some((tl, th)) = auto_y_range(&ys, metermode)
+    {
+        if view.y_seeded {
+            let k = 1.0 - (-dt * 8.0).exp();
+            view.y_min = if tl < view.y_min {
+                tl
+            } else {
+                view.y_min + (tl - view.y_min) * k
+            };
+            view.y_max = if th > view.y_max {
+                th
+            } else {
+                view.y_max + (th - view.y_max) * k
+            };
+        } else {
+            view.y_min = tl;
+            view.y_max = th;
+            view.y_seeded = true;
+        }
+    }
+    if view.y_max - view.y_min < 1e-12 {
+        view.y_max = view.y_min + 1e-12;
+    }
+    let (y_lo, y_hi) = (view.y_min, view.y_max);
+
+    // Is anything of the trace on screen?
+    let plottable = |y: &f64| y.is_finite() && !is_meter_overload(*y, metermode);
+    let on_screen = ys.iter().any(|y| plottable(y) && *y >= y_lo && *y <= y_hi);
+    let lost = !on_screen && ys.iter().any(plottable);
+    let no_data_in_view = series.len > 0 && xs.is_empty();
+
+    let gap = if xs.len() > 1 {
+        (xs[xs.len() - 1] - xs[0]) / xs.len() as f64 * 0.4
+    } else {
+        span * 0.005
+    };
+    let (meas_runs, ol_runs) = split_meas_and_ol(&xs, &ys, metermode);
+
+    let mut reset = false;
     ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
-        // Graph controls directly below the graph
+        // Bottom up: buffer row is lowest, view row above it.
         ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().slider_width = 120.0;
+            ui.label("Buffer");
             ui.add(
                 Slider::new(mem_depth, 10..=mem_depth_max)
-                    .text("Memory Depth")
-                    .step_by(10.0)
+                    .text("samples")
+                    .logarithmic(true)
                     .clamping(SliderClamping::Always),
             );
             ui.add(
                 Slider::new(graph_update_interval_ms, 10..=graph_update_interval_max)
-                    .text("Update Interval (ms)")
+                    .text("ms/sample")
                     .step_by(10.0)
                     .clamping(SliderClamping::Always),
             );
-            if ui.button("Reset Graph").clicked() {
-                values.clear();
-            }
-            ui.checkbox(reverse_graph_mut, "Reverse Graph (most recent on left)");
+            reset |= ui.button("Clear").clicked();
+            ui.checkbox(reverse_graph_mut, "Reverse time");
         });
-        ui.label("Graph Adjustments");
-        ui.separator();
-        // The graph itself
-        plot.show(ui, |plot_ui| {
-            // Get current bounds to base our adjustments on
-            let current_bounds = plot_ui.plot_bounds();
-            // Set exact x-axis bounds (same for both directions; reverse_graph affects data order)
-            let new_bounds = egui_plot::PlotBounds::from_min_max(
-                [0.0, current_bounds.min()[1]], // x=0 is most recent (if reversed) or oldest
-                [*mem_depth as f64, current_bounds.max()[1]], // x=mem_depth is oldest (if reversed) or most recent
+        ui.horizontal_wrapped(|ui| {
+            // Time
+            ui.label("Time");
+            if ui
+                .selectable_label(view.follow, "Live")
+                .on_hover_text("Follow the present (the right edge)")
+                .clicked()
+            {
+                view.follow = true;
+            }
+            ui.add_sized(
+                [72.0, 20.0],
+                egui::DragValue::new(&mut view.x_span)
+                    .speed(span * 0.01)
+                    .range(1e-3..=1e8)
+                    .custom_formatter(|n, _| crate::helpers::format_si(n, "s"))
+                    .custom_parser(|s| crate::helpers::parse_si(s, "s")),
+            )
+            .on_hover_text("Visible time span");
+            if ui
+                .small_button("−")
+                .on_hover_text("Zoom time out")
+                .clicked()
+            {
+                view.zoom_x(2.0);
+            }
+            if ui.small_button("+").on_hover_text("Zoom time in").clicked() {
+                view.zoom_x(0.5);
+            }
+            ui.separator();
+            // Value
+            ui.label("Value");
+            if ui
+                .selectable_label(view.auto_y, "Auto")
+                .on_hover_text("Fit the value axis to the visible data")
+                .clicked()
+            {
+                view.auto_y = true;
+            }
+            let speed = (view.y_max - view.y_min).abs() * 0.005;
+            for (v, hint) in [(&mut view.y_min, "Bottom"), (&mut view.y_max, "Top")] {
+                let unit_f = base_unit.clone();
+                let unit_p = base_unit.clone();
+                let r = ui.add_sized(
+                    [92.0, 20.0],
+                    egui::DragValue::new(v)
+                        .speed(speed)
+                        .custom_formatter(move |n, _| {
+                            if si {
+                                crate::helpers::format_si(n, &unit_f)
+                            } else {
+                                format!("{n:.3} {unit_f}")
+                            }
+                        })
+                        .custom_parser(move |s| crate::helpers::parse_si(s, &unit_p)),
+                );
+                if r.changed() {
+                    view.auto_y = false;
+                }
+                r.on_hover_text(hint);
+            }
+            if ui
+                .small_button("−")
+                .on_hover_text("Zoom value out")
+                .clicked()
+            {
+                view.zoom_y(2.0);
+            }
+            if ui
+                .small_button("+")
+                .on_hover_text("Zoom value in")
+                .clicked()
+            {
+                view.zoom_y(0.5);
+            }
+            ui.separator();
+            if ui
+                .button("Fit all")
+                .on_hover_text("Show the whole buffer")
+                .clicked()
+                && series.len > 0
+            {
+                view.follow = false;
+                view.x_min = t_first;
+                view.x_span = (t_last - t_first).max(1e-3);
+                view.auto_y = true;
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            {
+                let can_save = series.len > 0 && view.save_rx.is_none();
+                ui.add_enabled_ui(can_save, |ui| {
+                    ui.menu_button("Save…", |ui| {
+                        for (label, whole) in [
+                            ("Whole buffer (CSV)", true),
+                            ("Visible window (CSV)", false),
+                        ] {
+                            if ui.button(label).clicked() {
+                                ui.close();
+                                let (a, b) = if whole {
+                                    (0, series.len)
+                                } else {
+                                    series.window(x_lo, x_hi)
+                                };
+                                let rows: Vec<(f64, f64)> =
+                                    (a..b).map(|i| (series.t(i), series.v(i))).collect();
+                                view.save_rx = Some(spawn_csv_save(
+                                    ui.ctx().clone(),
+                                    rows,
+                                    base_unit.clone(),
+                                    metermode,
+                                    wall0,
+                                ));
+                                view.status = "Saving…".to_owned();
+                            }
+                        }
+                    });
+                });
+            }
+            ui.label("?").on_hover_text(
+                "Wheel: zoom time\nShift+wheel: scroll time\nCtrl+wheel: zoom value\n\
+                 Drag: scroll time (and value when Auto is off)\nDrag an axis: zoom just that axis",
             );
-            plot_ui.set_plot_bounds(new_bounds);
-            // Disable x-axis autoscaling, enable y-axis autoscaling
-            plot_ui.set_auto_bounds([false, true]);
+            if !view.status.is_empty() {
+                ui.weak(&view.status);
+            }
+        });
+        ui.separator();
+
+        let hover_unit = base_unit.clone();
+        let plot = Plot::new("graph")
+            .legend(Legend::default().text_style(egui::TextStyle::Monospace))
+            .y_axis_min_width(4.0)
+            .y_axis_label(curr_unit)
+            .x_axis_label("Time")
+            .invert_x(reverse_graph)
+            // Wheel and box-zoom are handled below so a stray scroll cannot lose the trace.
+            .allow_scroll(false)
+            .allow_zoom(false)
+            .allow_boxed_zoom(false)
+            .allow_double_click_reset(false)
+            .allow_drag([true, !view.auto_y])
+            .x_axis_formatter(move |mark, range| {
+                format_clock(mark.value, wall0, range.end() - range.start())
+            })
+            .y_axis_formatter(move |mark, range| {
+                crate::helpers::format_si_tick(mark.value, range.end() - range.start(), si)
+            })
+            .label_formatter(move |pos| {
+                let (y, x) = match pos {
+                    HoverPosition::NearDataPoint { position, .. } => (position.y, position.x),
+                    HoverPosition::Elsewhere { position } => (position.y, position.x),
+                };
+                let value = if si {
+                    crate::helpers::format_si(y, &hover_unit)
+                } else {
+                    format!("{y:.3} {hover_unit}")
+                };
+                Some(format!("{value}\n{}", format_clock(x, wall0, 1.0)))
+            })
+            .show_axes(true)
+            .show_grid(true);
+
+        let response = plot.show(ui, |plot_ui| {
+            plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                [x_lo, y_lo],
+                [x_hi, y_hi],
+            ));
+            plot_ui.set_auto_bounds([false, false]);
             for (i, run) in meas_runs.into_iter().enumerate() {
                 let name = if i == 0 { curr_unit } else { "" };
                 plot_ui.line(
@@ -153,14 +662,91 @@ pub fn show_line_graph(
             for (i, run) in ol_runs.into_iter().enumerate() {
                 let name = if i == 0 { "OVERLOAD" } else { "" };
                 plot_ui.line(
-                    Line::new(format!("ol{i}"), flatten_ol_run(&run))
+                    Line::new(format!("ol{i}"), flatten_ol_run(&run, gap))
                         .name(name)
                         .stroke(egui::Stroke::new(1.5, Color32::from_rgb(220, 50, 50)))
                         .style(LineStyle::Dashed { length: 3.0 }),
                 );
             }
+            let hint = if no_data_in_view {
+                Some("No samples in this time window - press Live or Fit all")
+            } else if lost {
+                Some("Trace is outside the value range - press Auto")
+            } else {
+                None
+            };
+            if let Some(hint) = hint {
+                plot_ui.text(
+                    egui_plot::Text::new(
+                        "hint",
+                        egui_plot::PlotPoint::new((x_lo + x_hi) / 2.0, (y_lo + y_hi) / 2.0),
+                        RichText::new(hint)
+                            .color(Color32::from_rgb(230, 160, 40))
+                            .size(15.0),
+                    )
+                    .name(""),
+                );
+            }
         });
+
+        // Pull drag and axis-zoom changes back into the view state.
+        let bounds = response.transform.bounds();
+        let (nx_lo, nx_hi) = (bounds.min()[0], bounds.max()[0]);
+        let (ny_lo, ny_hi) = (bounds.min()[1], bounds.max()[1]);
+        let tol_x = (x_hi - x_lo).abs() * 1e-4;
+        let tol_y = (y_hi - y_lo).abs() * 1e-4;
+        if (nx_lo - x_lo).abs() > tol_x || (nx_hi - x_hi).abs() > tol_x {
+            view.x_span = (nx_hi - nx_lo).max(1e-3);
+            view.x_min = nx_lo;
+            // Scrolling back to the present resumes following.
+            view.follow = nx_hi >= now - view.x_span * 0.005;
+        }
+        if (ny_lo - y_lo).abs() > tol_y || (ny_hi - y_hi).abs() > tol_y {
+            view.auto_y = false;
+            view.y_min = ny_lo;
+            view.y_max = ny_hi;
+        }
+
+        // Wheel: zoom time / scroll time / zoom value, around the cursor.
+        if response.response.hovered() {
+            let (scroll, zoom, cursor) =
+                ui.input(|i| (i.smooth_scroll_delta, i.zoom_delta(), i.pointer.hover_pos()));
+            let at = cursor.map(|p| response.transform.value_from_position(p));
+            if scroll.y != 0.0 {
+                let f = (-f64::from(scroll.y) * 0.004).exp();
+                if view.follow {
+                    view.zoom_x(f);
+                } else if let Some(at) = at {
+                    let new = (view.x_span * f).clamp(1e-3, 1e8);
+                    view.x_min = at.x - (at.x - view.x_min) * new / view.x_span;
+                    view.x_span = new;
+                }
+            }
+            if scroll.x != 0.0 {
+                let per_px = view.x_span / f64::from(response.response.rect.width().max(1.0));
+                let dir = if reverse_graph { 1.0 } else { -1.0 };
+                if view.follow {
+                    view.x_min = now - view.x_span * 0.99;
+                    view.follow = false;
+                }
+                view.x_min += dir * f64::from(scroll.x) * per_px;
+                if view.x_min + view.x_span >= now - view.x_span * 0.005 {
+                    view.follow = true;
+                }
+            }
+            if zoom != 1.0 {
+                let f = 1.0 / f64::from(zoom);
+                let anchor = at.map_or((view.y_min + view.y_max) / 2.0, |p| p.y);
+                view.auto_y = false;
+                view.y_min = anchor - (anchor - view.y_min) * f;
+                view.y_max = anchor + (view.y_max - anchor) * f;
+            }
+        }
     });
+    if reset {
+        values.clear();
+        times.clear();
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -250,7 +836,7 @@ pub fn show_psu_graphs(
             ui.add(
                 Slider::new(mem_depth, 10..=mem_depth_max)
                     .text("Memory Depth")
-                    .step_by(10.0)
+                    .logarithmic(true)
                     .clamping(SliderClamping::Always),
             );
             ui.add(
@@ -361,6 +947,15 @@ pub fn show_histogram(
     hist_mem_depth: &mut usize,
     hist_mem_depth_max: usize,
 ) {
+    let hist_unit = metermode.default_unit();
+    let hist_si = crate::helpers::mode_takes_si_prefix(&metermode);
+    let fmt_val = |v: f64| {
+        if hist_si {
+            crate::helpers::format_si(v, hist_unit)
+        } else {
+            format!("{v:.3} {hist_unit}")
+        }
+    };
     // Format the latest measurement for display
     let (_formatted_value, display_unit) = crate::helpers::format_measurement(
         curr_meas,
@@ -378,7 +973,7 @@ pub fn show_histogram(
         .copied()
         .filter(|y| y.is_finite() && !is_meter_overload(*y, metermode))
         .collect();
-    let (bar_chart, max_count, _num_bins, _bin_width, _range_start, _range_end) =
+    let (bar_chart, max_count, _num_bins, hist_bin_width, hist_range_start, hist_range_end) =
         if hist_values_vec.is_empty() {
             (
                 BarChart::new("Histogram (0 values, bin width: 0)".to_string(), vec![]),
@@ -452,8 +1047,8 @@ pub fn show_histogram(
                 hist_values_vec.len(),
                 formatted_bin_width.trim_start(),
                 bin_width_unit,
-                min,
-                max
+                fmt_val(min),
+                fmt_val(max)
             );
 
             // Create bars in normalized canvas coordinates (0 to num_bins)
@@ -611,7 +1206,12 @@ pub fn show_histogram(
             .show_axes(true)
             .show_grid(true)
             .y_axis_label("Count")
-            .x_axis_label("Bin Index")
+            .x_axis_label(format!("Value ({hist_unit})"))
+            .x_axis_formatter(move |mark, _| {
+                // Bars sit at bin index + 0.5; label them with the value they cover.
+                let value = hist_range_start + mark.value * hist_bin_width;
+                crate::helpers::format_si_tick(value, hist_range_end - hist_range_start, hist_si)
+            })
             .allow_scroll(false) // Prevent scrolling to keep bins stable
             .default_y_bounds(-0.1, 1.0)
             .include_y(max_count * 1.2)
@@ -655,10 +1255,14 @@ impl super::MyApp {
 mod tests {
     use super::*;
 
+    fn xs(ys: &[f64]) -> Vec<f64> {
+        (0..ys.len()).map(|i| i as f64).collect()
+    }
+
     #[test]
     fn ol_run_sits_in_the_gap_at_last_valid_y() {
         let ys = [1.0, 2.0, 9.9e31, 9.9e31, 3.0];
-        let (meas, ol) = split_meas_and_ol(&ys, MeterMode::Res);
+        let (meas, ol) = split_meas_and_ol(&xs(&ys), &ys, MeterMode::Res);
         assert_eq!(meas.len(), 2);
         assert_eq!(meas[0], [[0.0, 1.0], [1.0, 2.0]]);
         assert_eq!(meas[1], [[4.0, 3.0]]);
@@ -669,7 +1273,7 @@ mod tests {
     #[test]
     fn all_ol_keeps_scrolling_at_zero() {
         let ys = [9.9e31, 9.9e31];
-        let (meas, ol) = split_meas_and_ol(&ys, MeterMode::Adc);
+        let (meas, ol) = split_meas_and_ol(&xs(&ys), &ys, MeterMode::Adc);
         assert!(meas.is_empty());
         assert_eq!(ol, vec![vec![[0.0, 0.0], [1.0, 0.0]]]);
     }
@@ -677,7 +1281,7 @@ mod tests {
     #[test]
     fn one_gigahertz_is_not_an_ol_run() {
         let ys = [1e9];
-        let (meas, ol) = split_meas_and_ol(&ys, MeterMode::Freq);
+        let (meas, ol) = split_meas_and_ol(&xs(&ys), &ys, MeterMode::Freq);
         assert_eq!(meas, vec![vec![[0.0, 1e9]]]);
         assert!(ol.is_empty());
     }
@@ -685,8 +1289,176 @@ mod tests {
     #[test]
     fn ol_overlay_is_one_segment_not_per_sample() {
         let ys = [1.0, 9.9e31, 9.9e31, 9.9e31, 2.0];
-        let (_, ol) = split_meas_and_ol(&ys, MeterMode::Res);
+        let (_, ol) = split_meas_and_ol(&xs(&ys), &ys, MeterMode::Res);
         assert_eq!(ol[0].len(), 3);
-        assert_eq!(flatten_ol_run(&ol[0]), [[1.0, 1.0], [3.0, 1.0]]);
+        assert_eq!(flatten_ol_run(&ol[0], 0.4), [[1.0, 1.0], [3.0, 1.0]]);
+    }
+}
+
+#[cfg(test)]
+mod view_tests {
+    use super::*;
+
+    fn buffers(n: usize) -> (VecDeque<f64>, VecDeque<f64>) {
+        let times = (0..n).map(|i| i as f64 * 0.1).collect();
+        let values = (0..n).map(|i| (i % 7) as f64).collect();
+        (times, values)
+    }
+
+    #[test]
+    fn window_selects_padded_range() {
+        let (t, v) = buffers(100);
+        let s = Series::new(&t, &v);
+        let (i0, i1) = s.window(2.0, 3.0);
+        assert!(s.t(i0) <= 2.0 && s.t(i1 - 1) >= 3.0);
+        assert!(i1 - i0 <= 13);
+    }
+
+    #[test]
+    fn series_pairs_up_from_the_newest_end() {
+        let (mut t, mut v) = buffers(10);
+        for _ in 0..5 {
+            v.push_front(99.0); // stale extra values at the old end
+        }
+        t.pop_front();
+        let s = Series::new(&t, &v);
+        assert_eq!(s.len, 9);
+        assert_eq!(s.t(8), 9.0 * 0.1);
+        assert_eq!(s.v(8), (9 % 7) as f64);
+    }
+
+    #[test]
+    fn decimation_keeps_extremes_and_overload() {
+        let n = 30_000;
+        let times: VecDeque<f64> = (0..n).map(|i| i as f64).collect();
+        let mut values: VecDeque<f64> = (0..n).map(|i| (i % 100) as f64).collect();
+        values[12_345] = 500.0;
+        values[20_000] = 9.9e31;
+        let s = Series::new(&times, &values);
+        let (xs, ys) = s.decimated(0, n, MeterMode::Vdc, 3000, 10.0);
+        assert!(xs.len() <= 9000);
+        assert!(ys.contains(&500.0));
+        assert!(ys.contains(&9.9e31));
+        assert!(xs.windows(2).all(|w| w[0] <= w[1]));
+    }
+
+    #[test]
+    fn clock_ticks_format_at_every_precision() {
+        for span in [0.01, 1.0, 10.0, 600.0] {
+            let s = format_clock(12.3456, 1_700_000_000.0, span);
+            assert!(s.len() >= 8 && s.contains(':'), "{s}");
+        }
+    }
+
+    #[test]
+    fn auto_range_ignores_overload_and_pads() {
+        let (lo, hi) = auto_y_range(&[1.0, 3.0, 9.9e31], MeterMode::Vdc).unwrap();
+        assert!(lo < 1.0 && hi > 3.0 && hi < 4.0);
+        assert!(auto_y_range(&[9.9e31], MeterMode::Vdc).is_none());
+        let (lo, hi) = auto_y_range(&[2.0, 2.0], MeterMode::Vdc).unwrap();
+        assert!(lo < 2.0 && hi > 2.0);
+    }
+}
+
+#[cfg(test)]
+mod frame_tests {
+    use super::*;
+
+    /// Run the real graph for many frames with live data, wheel and drag input.
+    #[test]
+    fn graph_survives_live_frames_and_input() {
+        let ctx = egui::Context::default();
+        let mut values: VecDeque<f64> = VecDeque::new();
+        let mut times: VecDeque<f64> = VecDeque::new();
+        let mut view = GraphView::default();
+        let (mut depth, mut interval, mut reverse) = (50_000usize, 20u64, false);
+        let pos = egui::pos2(300.0, 200.0);
+        let mut span_before = 0.0;
+        for frame in 0..600 {
+            let t = frame as f64 * 0.02;
+            let mut input = egui::RawInput {
+                time: Some(t),
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(800.0, 500.0),
+                )),
+                ..Default::default()
+            };
+            input.events.push(egui::Event::PointerMoved(pos));
+            match frame {
+                100..=130 => input.events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, 20.0),
+                    modifiers: egui::Modifiers::NONE,
+                    phase: egui::TouchPhase::Move,
+                }),
+                200..=230 => input.events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(15.0, 0.0),
+                    modifiers: egui::Modifiers::SHIFT,
+                    phase: egui::TouchPhase::Move,
+                }),
+                300..=320 => input.events.push(egui::Event::MouseWheel {
+                    unit: egui::MouseWheelUnit::Point,
+                    delta: egui::vec2(0.0, 20.0),
+                    modifiers: egui::Modifiers::CTRL,
+                    phase: egui::TouchPhase::Move,
+                }),
+                _ => {}
+            }
+            if frame == 400 {
+                // overload run plus a gap in the data
+                for _ in 0..5 {
+                    values.push_back(9.9e31);
+                    times.push_back(t);
+                }
+            }
+            if frame == 450 {
+                view.follow = false;
+                view.x_min = t + 1000.0; // scrolled away: no samples in view
+            }
+            if frame == 500 {
+                view.zoom_x(1e-6);
+                view.zoom_y(1e-6);
+            }
+            values.push_back((t * 3.0).sin() * 1e-3);
+            times.push_back(t);
+            let mut out = ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    show_line_graph(
+                        ui,
+                        &mut values,
+                        &mut times,
+                        &mut view,
+                        reverse,
+                        Color32::GREEN,
+                        &mut depth,
+                        &mut interval,
+                        &mut reverse,
+                        1_000_000,
+                        1000,
+                        "VDC",
+                        MeterMode::Vdc,
+                    );
+                });
+            });
+            out.textures_delta.clear();
+            match frame {
+                99 => span_before = view.x_span,
+                140 => {
+                    assert!(view.x_span < span_before, "wheel should zoom time in");
+                    assert!(view.follow, "zooming while live keeps following");
+                    assert!(view.auto_y);
+                }
+                235 => assert!(!view.follow, "shift+wheel scrolls back in time"),
+                330 => assert!(!view.auto_y, "ctrl+wheel zooms value manually"),
+                _ => {}
+            }
+            if frame == 350 {
+                reverse = true;
+            }
+        }
+        assert!(view.y_max > view.y_min);
+        assert!(view.x_span > 0.0);
     }
 }

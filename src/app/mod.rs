@@ -90,8 +90,15 @@ pub(crate) fn open_victor_7o1_serial(
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
-const MEM_DEPTH_DEFAULT: usize = 100; // Default slider value
-const MEM_DEPTH_MAX_DEFAULT: usize = 2000; // Default maximum
+/// Bumped when persisted settings need a one-off migration (see `MyApp::new`).
+const SETTINGS_VERSION: u32 = 1;
+
+fn legacy_settings_version() -> u32 {
+    0 // saved state from before the field existed
+}
+
+const MEM_DEPTH_DEFAULT: usize = 50_000; // Default slider value (~17 min at 50 samples/s)
+const MEM_DEPTH_MAX_DEFAULT: usize = 1_000_000; // Default maximum
 const HIST_MEM_DEPTH_DEFAULT: usize = 1000; // Default histogram memory depth
 const HIST_MEM_DEPTH_MAX_DEFAULT: usize = 10000; // Default maximum histogram memory depth
 
@@ -140,16 +147,16 @@ pub struct Record {
 }
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 struct ModeDisplaySettings {
-    /// Prefer mV / kΩ / µF etc. from magnitude (default on, same as SCPI).
-    pub auto_scale_units: bool,
+    /// SI-prefixed readout (mV, kΩ, µF ...), default on. Renamed from `auto_scale_units`
+    /// so values saved while it defaulted to a plain `x.xxxxx` readout do not stick.
+    pub si_units: bool,
 }
 
 impl Default for ModeDisplaySettings {
     fn default() -> Self {
-        Self {
-            auto_scale_units: true,
-        }
+        Self { si_units: true }
     }
 }
 
@@ -157,6 +164,8 @@ impl Default for ModeDisplaySettings {
 #[derive(Serialize, Deserialize)]
 #[serde(default)] // if we add new fields, give them default values when deserializing old state
 pub struct MyApp {
+    #[serde(default = "legacy_settings_version")]
+    settings_version: u32,
     connection_type: ConnectionType,
     serial_port: String,
     #[cfg(not(target_arch = "wasm32"))]
@@ -211,6 +220,10 @@ pub struct MyApp {
     #[serde(default)]
     scpi_macros: Vec<ScpiMacro>,
     #[serde(skip)]
+    recording_error: String, // Last save failure, shown in the recording window
+    #[serde(skip)]
+    recording_path_rx: Option<std::sync::mpsc::Receiver<Option<String>>>, // Pending Browse dialog
+    #[serde(skip)]
     recording_data: Vec<Record>, // Do not persist recording data
     #[serde(skip)]
     recording_data_len: usize, // Do not persist, tracks length of recording_data for auto-scroll
@@ -237,6 +250,14 @@ pub struct MyApp {
     hid_devicelist: VecDeque<(String, String)>,
     #[serde(skip)]
     values: VecDeque<f64>,
+    #[serde(skip)]
+    meas_seq: u64, // Bumped per received reading
+    #[serde(skip)]
+    graph_seq: u64, // `meas_seq` at the last graph sample: one sample per reading
+    #[serde(skip)]
+    value_times: VecDeque<f64>, // Sample times (egui seconds), aligned to the end of `values`
+    #[serde(skip)]
+    graph_view: graph::GraphView,
     #[serde(skip)]
     psu_curr_trace: VecDeque<f64>,
     #[serde(skip)]
@@ -375,6 +396,7 @@ enum ConnectionState {
 impl Default for MyApp {
     fn default() -> Self {
         Self {
+            settings_version: SETTINGS_VERSION,
             connection_type: ConnectionType::default(),
             serial_port: "".to_owned(),
             #[cfg(not(target_arch = "wasm32"))]
@@ -402,7 +424,11 @@ impl Default for MyApp {
             portlist: VecDeque::with_capacity(11),
             #[cfg(not(target_arch = "wasm32"))]
             hid_devicelist: VecDeque::with_capacity(4),
-            values: VecDeque::with_capacity(MEM_DEPTH_DEFAULT + 1),
+            values: VecDeque::with_capacity(4096),
+            meas_seq: 0,
+            graph_seq: 0,
+            value_times: VecDeque::with_capacity(4096),
+            graph_view: graph::GraphView::default(),
             psu_curr_trace: VecDeque::with_capacity(MEM_DEPTH_DEFAULT + 1),
             psu_power_trace: VecDeque::with_capacity(MEM_DEPTH_DEFAULT + 1),
             hist_values: VecDeque::with_capacity(MEM_DEPTH_DEFAULT + 1), // Initialize histogram buffer
@@ -434,7 +460,9 @@ impl Default for MyApp {
             hist_bar_color: Color32::from_rgb(0, 255, 255), // Default to cyan (#00FFFF)
             measurement_font_color: Color32::from_rgb(0, 255, 255), // Default to cyan (#00FFFF)
             box_background_color: Color32::from_rgba_unmultiplied(0, 0, 0, 255), // Default to black
-            recording_open: false,                          // Always start closed
+            recording_error: String::new(),
+            recording_path_rx: None,
+            recording_open: false, // Always start closed
             recording_format: RecordingFormat::Csv,
             recording_file_path: "".to_owned(),
             recording_mode: RecordingMode::FixedInterval,
@@ -535,7 +563,15 @@ impl MyApp {
         // Load previous app state (if any).
         // Note that you must enable the `persistence` feature for this to work.
         if let Some(storage) = cc.storage {
-            let app: MyApp = eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default();
+            let mut app: MyApp = eframe::get_value(storage, eframe::APP_KEY).unwrap_or_default();
+            if app.settings_version < SETTINGS_VERSION {
+                // v1: the graph keeps history; the old default cap was 2000 samples.
+                if app.mem_depth_max <= 2000 {
+                    app.mem_depth_max = MEM_DEPTH_MAX_DEFAULT;
+                    app.mem_depth = MEM_DEPTH_DEFAULT;
+                }
+                app.settings_version = SETTINGS_VERSION;
+            }
             *app.value_debug_shared.lock().unwrap() = app.value_debug;
             *app.poll_interval_shared.lock().unwrap() = app.poll_interval_ms;
             app.poll_ready.store(false, Ordering::SeqCst);
@@ -711,6 +747,7 @@ impl MyApp {
             PsuUpdate::Sample(sample) => {
                 self.psu.apply_sample(sample);
                 self.curr_meas = sample.volt;
+                self.meas_seq = self.meas_seq.wrapping_add(1);
                 self.curr_unit = "V".to_owned();
                 self.values.push_back(sample.volt);
                 self.psu_curr_trace.push_back(sample.curr);
@@ -729,9 +766,21 @@ impl MyApp {
         }
     }
 
+    /// Empty every graph and histogram buffer, keeping their allocations.
+    fn clear_graph_buffers(&mut self) {
+        self.values.clear();
+        self.value_times.clear();
+        self.psu_curr_trace.clear();
+        self.psu_power_trace.clear();
+        self.hist_values.clear();
+    }
+
     fn trim_graph_traces(&mut self) {
         while self.values.len() > self.mem_depth {
             self.values.pop_front();
+        }
+        while self.value_times.len() > self.values.len() {
+            self.value_times.pop_front();
         }
         while self.psu_curr_trace.len() > self.mem_depth {
             self.psu_curr_trace.pop_front();
@@ -907,10 +956,7 @@ impl MyApp {
         }
         self.metermode = mode;
         self.curr_unit = unit.unwrap_or(mode.default_unit()).to_owned();
-        self.values = VecDeque::with_capacity(self.mem_depth);
-        self.psu_curr_trace = VecDeque::with_capacity(self.mem_depth);
-        self.psu_power_trace = VecDeque::with_capacity(self.mem_depth);
-        self.hist_values = VecDeque::with_capacity(self.hist_mem_depth);
+        self.clear_graph_buffers();
         self.rangecmd = if self.is_read_only() {
             None
         } else {
@@ -990,14 +1036,11 @@ impl MyApp {
     pub fn auto_scale_units(&self, mode: &MeterMode) -> bool {
         self.mode_display_settings
             .get(mode)
-            .is_none_or(|s| s.auto_scale_units) // default = enabled
+            .is_none_or(|s| s.si_units) // default = enabled
     }
 
     pub fn set_auto_scale_units(&mut self, mode: MeterMode, enabled: bool) {
-        self.mode_display_settings
-            .entry(mode)
-            .or_default()
-            .auto_scale_units = enabled;
+        self.mode_display_settings.entry(mode).or_default().si_units = enabled;
         // Optional: self.save_settings() if you have an immediate-save helper
     }
 

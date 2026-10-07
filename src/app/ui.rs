@@ -87,6 +87,8 @@ pub enum PlotTab {
 // Tab viewer implementation for PlotTab
 struct PlotTabViewer<'a> {
     values: &'a mut VecDeque<f64>,
+    value_times: &'a mut VecDeque<f64>,
+    graph_view: &'a mut super::graph::GraphView,
     psu_curr: Option<&'a mut VecDeque<f64>>,
     psu_power: Option<&'a mut VecDeque<f64>>,
     psu_style: Option<super::graph::PsuGraphStyle>,
@@ -154,6 +156,8 @@ impl TabViewer for PlotTabViewer<'_> {
                     super::graph::show_line_graph(
                         ui,
                         self.values,
+                        self.value_times,
+                        self.graph_view,
                         *self.reverse_graph,
                         self.graph_line_color,
                         self.mem_depth,
@@ -548,14 +552,17 @@ impl super::MyApp {
                     self.victor_lcd_display = update.display;
                     if let Some(v) = update.value {
                         self.curr_meas = v;
+                        self.meas_seq = self.meas_seq.wrapping_add(1);
                     }
                     if update.mode != self.metermode {
                         self.metermode = update.mode;
                         self.curr_unit = update.unit;
-                        self.values = VecDeque::with_capacity(self.mem_depth);
-                        self.psu_curr_trace = VecDeque::with_capacity(self.mem_depth);
-                        self.psu_power_trace = VecDeque::with_capacity(self.mem_depth);
-                        self.hist_values = VecDeque::with_capacity(self.hist_mem_depth);
+                        // Fields, not `clear_graph_buffers()`: `rx` still borrows `self`.
+                        self.values.clear();
+                        self.value_times.clear();
+                        self.psu_curr_trace.clear();
+                        self.psu_power_trace.clear();
+                        self.hist_values.clear();
                         self.rangecmd = None;
                         self.curr_range = 0;
                         if self.value_debug {
@@ -579,6 +586,7 @@ impl super::MyApp {
                 while let Ok(meas_opt) = rx.try_recv() {
                     if let Some(meas) = meas_opt {
                         self.curr_meas = meas;
+                        self.meas_seq = self.meas_seq.wrapping_add(1);
                     }
                 }
             }
@@ -643,11 +651,17 @@ impl super::MyApp {
         if current_time - self.last_graph_update >= graph_interval {
             // Skip non-finite samples — histogram binning panics on Inf/NaN.
             if self.curr_meas.is_finite() {
-                if !self.scpi_is_psu {
-                    self.values.push_back(self.curr_meas);
+                // One sample per received reading; re-sampling the same reading
+                // would only add duplicate rows to the graph, histogram and exports.
+                if self.meas_seq != self.graph_seq {
+                    self.graph_seq = self.meas_seq;
+                    if !self.scpi_is_psu {
+                        self.values.push_back(self.curr_meas);
+                        self.value_times.push_back(current_time);
+                    }
+                    self.update_histogram(self.curr_meas); // Update histogram with new measurement
+                    self.trim_graph_traces();
                 }
-                self.update_histogram(self.curr_meas); // Update histogram with new measurement
-                self.trim_graph_traces();
                 // Record measurement for fixed interval mode
                 if self.recording_active
                     && matches!(self.recording_mode, super::RecordingMode::FixedInterval)
@@ -1285,6 +1299,8 @@ impl super::MyApp {
                 let dock_state = &mut self.plot_dock_state;
                 let mut viewer = PlotTabViewer {
                     values: &mut self.values,
+                    value_times: &mut self.value_times,
+                    graph_view: &mut self.graph_view,
                     psu_curr: if self.scpi_is_psu {
                         Some(&mut self.psu_curr_trace)
                     } else {

@@ -24,6 +24,111 @@ pub fn is_meter_overload(value: f64, mode: MeterMode) -> bool {
         )
 }
 
+/// SI prefixes by decimal exponent, pico to tera.
+const SI_PREFIXES: [(i32, &str); 9] = [
+    (-12, "p"),
+    (-9, "n"),
+    (-6, "μ"),
+    (-3, "m"),
+    (0, ""),
+    (3, "k"),
+    (6, "M"),
+    (9, "G"),
+    (12, "T"),
+];
+
+/// Modes whose unit takes an SI prefix. Duty (%) and temperature do not.
+pub fn mode_takes_si_prefix(mode: &MeterMode) -> bool {
+    !matches!(mode, MeterMode::Duty | MeterMode::Temp)
+}
+
+fn si_exponent(value: f64) -> i32 {
+    if !value.is_finite() || value == 0.0 {
+        return 0;
+    }
+    let exp = (value.abs().log10().floor() as i32).div_euclid(3) * 3;
+    exp.clamp(-12, 12)
+}
+
+fn si_prefix_for(exp: i32) -> &'static str {
+    SI_PREFIXES
+        .iter()
+        .find(|(e, _)| *e == exp)
+        .map_or("", |(_, p)| p)
+}
+
+/// Scale `value` into 1..1000 and return it with its SI prefix.
+/// Zero and non-finite values stay unscaled.
+pub fn si_scale(value: f64) -> (f64, &'static str) {
+    let exp = si_exponent(value);
+    (value / 10f64.powi(exp), si_prefix_for(exp))
+}
+
+/// Compact SI number with unit, e.g. `1.5 mV`. Trailing zeros are trimmed.
+pub fn format_si(value: f64, unit: &str) -> String {
+    format_si_range(value, f64::INFINITY, unit, true)
+}
+
+/// Like `format_si`, with enough decimals to tell apart values `range / 50` apart.
+fn format_si_range(value: f64, range: f64, unit: &str, si: bool) -> String {
+    if !value.is_finite() {
+        return value.to_string();
+    }
+    if value == 0.0 {
+        return if unit.is_empty() {
+            "0".to_owned()
+        } else {
+            format!("0 {unit}")
+        };
+    }
+    let exp = if si { si_exponent(value) } else { 0 };
+    let scaled = value / 10f64.powi(exp);
+    let decimals = if range.is_finite() && range > 0.0 {
+        let step = range / 10f64.powi(exp) / 50.0;
+        ((-step.log10()).ceil() as i32).clamp(0, 9) as usize
+    } else {
+        5
+    };
+    let mut text = format!("{scaled:.decimals$}");
+    if text.contains('.') {
+        text.truncate(text.trim_end_matches('0').trim_end_matches('.').len());
+    }
+    let prefix = si_prefix_for(exp);
+    if unit.is_empty() {
+        format!("{text}{prefix}")
+    } else {
+        format!("{text} {prefix}{unit}")
+    }
+}
+
+/// Axis tick label: SI prefix on the number, no unit (the axis label carries it).
+pub fn format_si_tick(value: f64, range: f64, si: bool) -> String {
+    format_si_range(value, range, "", si)
+}
+
+/// Parse `5m`, `250u`, `1.5k`, `2 mV` (unit letters after the prefix are ignored).
+pub fn parse_si(text: &str, unit: &str) -> Option<f64> {
+    let t = text.trim().replace(['µ', 'μ'], "u");
+    let t = t.strip_suffix(unit).unwrap_or(&t).trim();
+    if let Ok(v) = t.parse::<f64>() {
+        return Some(v);
+    }
+    let last = t.chars().last()?;
+    let exp = match last {
+        'p' => -12,
+        'n' => -9,
+        'u' => -6,
+        'm' => -3,
+        'k' | 'K' => 3,
+        'M' => 6,
+        'G' => 9,
+        'T' => 12,
+        _ => return None,
+    };
+    let num: f64 = t[..t.len() - last.len_utf8()].trim().parse().ok()?;
+    Some(num * 10f64.powi(exp))
+}
+
 pub fn format_measurement(
     value: f64,
     max_digits: usize,
@@ -55,57 +160,11 @@ pub fn format_measurement(
     let mut display_value = value;
     let mut display_unit = meter_mode.default_unit().to_string();
 
-    // Adjust value and unit based on mode and magnitude
-    if auto_scale_units {
-        match meter_mode {
-            MeterMode::Vdc | MeterMode::Vac if abs_value < 1.0 => {
-                display_value = value * 1000.0;
-                display_unit = if matches!(meter_mode, MeterMode::Vdc) {
-                    "mVDC"
-                } else {
-                    "mVAC"
-                }
-                .to_string();
-            }
-            MeterMode::Adc | MeterMode::Aac if abs_value < 1.0 => {
-                display_value = value * 1000.0;
-                display_unit = if matches!(meter_mode, MeterMode::Adc) {
-                    "mADC"
-                } else {
-                    "mAAC"
-                }
-                .to_string();
-            }
-            MeterMode::Res | MeterMode::Fres | MeterMode::Cont => {
-                if abs_value >= 1_000_000.0 {
-                    display_value = value / 1_000_000.0;
-                    display_unit = "MOhm".to_string();
-                } else if abs_value >= 1_000.0 {
-                    display_value = value / 1_000.0;
-                    display_unit = "kOhm".to_string();
-                } else if abs_value < 1.0 && abs_value > 0.0 {
-                    display_value = value * 1000.0;
-                    display_unit = "mOhm".to_string();
-                }
-            }
-            MeterMode::Cap => {
-                if abs_value >= 0.001 {
-                    display_value = value * 1000.0;
-                    display_unit = "mF".to_string();
-                } else if abs_value >= 0.000_001 {
-                    display_value = value * 1_000_000.0;
-                    display_unit = "μF".to_string();
-                } else if abs_value > 0.0 {
-                    display_value = value * 1_000_000_000.0;
-                    display_unit = "nF".to_string();
-                }
-            }
-            MeterMode::Per if abs_value < 1.0 => {
-                display_value = value * 1000.0;
-                display_unit = "ms".to_string();
-            }
-            _ => {}
-        }
+    // Adjust value and unit to an SI prefix (mV, kOhm, uF, ...) so the value reads 1..1000.
+    if auto_scale_units && mode_takes_si_prefix(meter_mode) && abs_value > 0.0 {
+        let (scaled, prefix) = si_scale(value);
+        display_value = scaled;
+        display_unit = format!("{prefix}{display_unit}");
     }
 
     let abs_display_value = display_value.abs();
@@ -181,9 +240,37 @@ mod tests {
     }
 
     #[test]
+    fn readout_uses_si_prefixes() {
+        let f = |v: f64, m: MeterMode| {
+            let (t, u) = format_measurement(v, 10, 1e15, 1e-15, &m, true, None);
+            (t.trim().to_owned(), u)
+        };
+        assert_eq!(f(0.0123, MeterMode::Vdc), ("12.3000".into(), "mVDC".into()));
+        assert_eq!(f(4.7e-6, MeterMode::Adc), ("4.70000".into(), "μADC".into()));
+        assert_eq!(f(2.5e-9, MeterMode::Per), ("2.50000".into(), "ns".into()));
+        assert_eq!(f(1.5e6, MeterMode::Freq), ("1.50000".into(), "MHz".into()));
+        assert_eq!(f(4700.0, MeterMode::Res), ("4.70000".into(), "kOhm".into()));
+        assert_eq!(f(3.3, MeterMode::Vdc), ("3.30000".into(), "VDC".into()));
+        assert_eq!(f(50.0, MeterMode::Duty), ("50.0000".into(), "%".into()));
+    }
+
+    #[test]
+    fn si_tick_and_parse() {
+        assert_eq!(format_si_tick(0.0, 1.0, true), "0");
+        assert_eq!(format_si_tick(0.0005, 0.01, true), "500μ");
+        assert_eq!(format_si_tick(1500.0, 5000.0, true), "1.5k");
+        assert_eq!(format_si(0.0015, "V"), "1.5 mV");
+        assert_eq!(format_si_tick(0.25, 1.0, false), "0.25");
+        assert_eq!(parse_si("250u", "V"), Some(250e-6));
+        assert_eq!(parse_si("2 mV", "V"), Some(2e-3));
+        assert_eq!(parse_si("1.5k", ""), Some(1500.0));
+        assert_eq!(parse_si("abc", ""), None);
+    }
+
+    #[test]
     fn gigahertz_is_not_overload() {
         let (text, unit) = format_measurement(1e9, 10, 1e12, 1e-6, &MeterMode::Freq, true, None);
         assert_ne!(text, "OVERLOAD");
-        assert_eq!(unit, "Hz");
+        assert_eq!(unit, "GHz");
     }
 }
