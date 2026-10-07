@@ -57,9 +57,23 @@ Maybe some stuff even works out of the box.
 - code refactoring for easier integration of other meters
 - make serial parameters changeable
 
+## The graph
+
+The graph keeps a long history (50 000 samples by default, up to 1 000 000 in the *Buffer* row) so you can
+look back and save what you saw without having to start a recording first. One sample is stored per reading
+the meter delivers.
+
+- **Time** and **Value** are scaled independently. Axis ticks and the readout use SI prefixes (mV, µA, kOhm, ...).
+- Mouse wheel: zoom time. Shift+wheel: scroll time. Ctrl+wheel: zoom value.
+  Drag: scroll time (and value when *Auto* is off). Drag on an axis: zoom just that axis.
+- **Live** follows the present, **Auto** fits the value axis to the visible data, **Fit all** shows the whole buffer.
+  If the trace is out of view the plot says so.
+- **Save…** writes the whole buffer or the visible window to CSV (timestamp, seconds, value, unit; overload is `OL`).
+
 ## How to get going
 
 You can clone this repository and just run `cargo build --release`, provided you have rust installed (use `rustup`, it's easy).
+No C toolchain extras are needed (XLSX export is pure Rust); on Linux you need the usual `libudev-dev` and X11/xkbcommon development packages.
 The Releases section has automatically built releases for Mac ARM64 and x86_64, Windows 11 x86_64 and Linux x86_64.
 
 ### IMPORTANT for Windows

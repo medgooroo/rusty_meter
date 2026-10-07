@@ -1,5 +1,23 @@
 # CHANGELOG
 
+## Unreleased
+
+Readout and graph overhaul.
+
+- The big readout uses SI prefixes in every mode (mV, µA, ns, kOhm, MHz, ...). The per-mode setting
+  was renamed (`si_units`, default on) so values saved by older versions do not keep it off.
+- The graph has a time axis (clock time) and independent time/value zoom and scroll, readable SI
+  tick labels, a Live/Auto/Fit control row, and warns when the trace is out of view.
+  The mouse wheel no longer pans the value axis by accident.
+- The graph keeps a long history (default 50 000 samples) and can be saved to CSV after the fact
+  (whole buffer or visible window). One sample is stored per reading received instead of re-sampling
+  the last value every update interval.
+- File dialogs no longer block sampling. Recording save errors are shown in the recording window
+  (with a retry) instead of crashing the app.
+- Histogram x axis shows values instead of bin indices.
+- XLSX export now uses `rust_xlsxwriter` (pure Rust): libclang and a C compiler are no longer
+  needed to build.
+
 ## 0.8.0
 
 Add FRES/4W-Resistance support for the Owon XDM2041 and support for the XDM3041/3051
