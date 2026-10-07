@@ -39,7 +39,7 @@ mio = "1.2.3"
 tokio = { version = "1.53.1", features = ["full"] }
 serde = { version = "1.0.229", features = ["derive"] }
 csv = "1.4.0" # For CSV output
-xlsxwriter = "0.6.1" # For XLSX output
+rust_xlsxwriter = "0.99" # For XLSX output (pure Rust, no libclang)
 chrono = { version = "0.4.45", features = [
     "serde",
 ] } # For timestamp handling with serde

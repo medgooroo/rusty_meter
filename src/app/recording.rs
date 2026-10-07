@@ -4,11 +4,18 @@ use std::path::{Path, PathBuf};
 use csv::WriterBuilder;
 use egui::{FontId, RichText, TextEdit, ViewportBuilder, ViewportId};
 use egui_extras::{Column, TableBuilder};
-use rfd::FileDialog;
-use xlsxwriter::Workbook;
+use rust_xlsxwriter::Workbook;
 
 impl super::MyApp {
     pub fn show_recording_window(&mut self, ui: &mut egui::Ui) {
+        if let Some(rx) = &self.recording_path_rx
+            && let Ok(picked) = rx.try_recv()
+        {
+            self.recording_path_rx = None;
+            if let Some(path) = picked {
+                self.recording_file_path = path;
+            }
+        }
         if self.recording_open {
             let viewport_id = ViewportId::from_hash_of("recording_viewport");
 
@@ -116,21 +123,32 @@ impl super::MyApp {
                                         .desired_width(300.0)
                                         .hint_text("Select or enter file path"),
                                 );
-                                if ui.button("Browse").clicked() {
-                                    if let Some(path) = FileDialog::new()
-                                        .add_filter(
-                                            "Data Files",
-                                            match self.recording_format {
-                                                super::RecordingFormat::Csv => &["csv"],
-                                                super::RecordingFormat::Json => &["json"],
-                                                super::RecordingFormat::Xlsx => &["xlsx"],
-                                            },
-                                        )
-                                        .save_file()
-                                    {
-                                        self.recording_file_path =
-                                            path.to_string_lossy().into_owned();
-                                    }
+                                if ui
+                                    .add_enabled(
+                                        self.recording_path_rx.is_none(),
+                                        egui::Button::new("Browse"),
+                                    )
+                                    .clicked()
+                                {
+                                    let ext: &'static [&'static str] = match self.recording_format {
+                                        super::RecordingFormat::Csv => &["csv"],
+                                        super::RecordingFormat::Json => &["json"],
+                                        super::RecordingFormat::Xlsx => &["xlsx"],
+                                    };
+                                    let (tx, rx) = std::sync::mpsc::channel();
+                                    self.recording_path_rx = Some(rx);
+                                    let ctx = ui.ctx().clone();
+                                    // Dialog runs off the UI thread so sampling keeps going.
+                                    tokio::spawn(async move {
+                                        let picked = rfd::AsyncFileDialog::new()
+                                            .add_filter("Data Files", ext)
+                                            .save_file()
+                                            .await;
+                                        let _ = tx.send(
+                                            picked.map(|f| f.path().to_string_lossy().into_owned()),
+                                        );
+                                        ctx.request_repaint();
+                                    });
                                 }
                             });
 
@@ -178,6 +196,18 @@ impl super::MyApp {
                                 } else if !self.recording_file_path.is_empty() {
                                     self.recording_active = true;
                                 }
+                            }
+
+                            if !self.recording_error.is_empty() {
+                                ui.horizontal(|ui| {
+                                    ui.colored_label(
+                                        egui::Color32::LIGHT_RED,
+                                        &self.recording_error,
+                                    );
+                                    if ui.button("Retry save").clicked() {
+                                        self.save_recording_data();
+                                    }
+                                });
                             }
 
                             // Manual record button
@@ -314,10 +344,19 @@ impl super::MyApp {
         }
     }
 
-    pub fn save_recording_data(&self) {
+    /// Write the recording and remember any failure for the window (never panics).
+    pub fn save_recording_data(&mut self) {
+        self.recording_error = match self.write_recording_data() {
+            Ok(()) => String::new(),
+            Err(e) => format!("Save failed: {e}"),
+        };
+    }
+
+    fn write_recording_data(&self) -> Result<(), String> {
         if self.recording_data.is_empty() || self.recording_file_path.is_empty() {
-            return;
+            return Ok(());
         }
+        let err = |what: &str, e: &dyn std::fmt::Display| format!("{what}: {e}");
 
         let (ch_names, st_names) = recording_column_names(&self.recording_data);
         let legacy = is_legacy_layout(&self.recording_data);
@@ -325,24 +364,24 @@ impl super::MyApp {
 
         match self.recording_format {
             super::RecordingFormat::Csv => {
-                let file =
-                    File::create(&self.recording_file_path).expect("Failed to create CSV file");
+                let file = File::create(&self.recording_file_path)
+                    .map_err(|e| err("create CSV file", &e))?;
                 let mut writer = WriterBuilder::new().from_writer(file);
                 writer
                     .write_record(&headers)
-                    .expect("Failed to write CSV header");
+                    .map_err(|e| err("write CSV header", &e))?;
                 for record in &self.recording_data {
                     let ts = self.format_record_timestamp(record);
                     let cells = export_cells(record, legacy, &ch_names, &st_names, &ts);
                     writer
                         .write_record(&cells)
-                        .expect("Failed to write CSV record");
+                        .map_err(|e| err("write CSV record", &e))?;
                 }
-                writer.flush().expect("Failed to flush CSV writer");
+                writer.flush().map_err(|e| err("flush CSV", &e))?;
             }
             super::RecordingFormat::Json => {
-                let file =
-                    File::create(&self.recording_file_path).expect("Failed to create JSON file");
+                let file = File::create(&self.recording_file_path)
+                    .map_err(|e| err("create JSON file", &e))?;
                 let records: Vec<serde_json::Value> = self
                     .recording_data
                     .iter()
@@ -358,18 +397,15 @@ impl super::MyApp {
                         record_json(record, timestamp_value, legacy)
                     })
                     .collect();
-                serde_json::to_writer(file, &records).expect("Failed to write JSON data");
+                serde_json::to_writer(file, &records).map_err(|e| err("write JSON", &e))?;
             }
             super::RecordingFormat::Xlsx => {
-                let workbook =
-                    Workbook::new(&self.recording_file_path).expect("Failed to create XLSX file");
-                let mut sheet = workbook
-                    .add_worksheet(None)
-                    .expect("Failed to add worksheet");
+                let mut workbook = Workbook::new();
+                let sheet = workbook.add_worksheet();
                 for (col, title) in headers.iter().enumerate() {
                     sheet
-                        .write_string(0, col as u16, title, None)
-                        .expect("Failed to write XLSX header");
+                        .write_string(0, col as u16, title)
+                        .map_err(|e| err("write XLSX header", &e))?;
                 }
                 for (i, record) in self.recording_data.iter().enumerate() {
                     let ts = self.format_record_timestamp(record);
@@ -377,26 +413,24 @@ impl super::MyApp {
                     let row = (i + 1) as u32;
                     for (col, cell) in cells.iter().enumerate() {
                         let col = col as u16;
-                        if col == 0 {
-                            sheet
-                                .write_number(row, col, record.index as f64, None)
-                                .expect("Failed to write XLSX record");
+                        let written = if col == 0 {
+                            sheet.write_number(row, col, record.index as f64)
                         } else if let Ok(n) = cell.parse::<f64>()
                             && n.is_finite()
                         {
-                            sheet
-                                .write_number(row, col, n, None)
-                                .expect("Failed to write XLSX record");
+                            sheet.write_number(row, col, n)
                         } else {
-                            sheet
-                                .write_string(row, col, cell, None)
-                                .expect("Failed to write XLSX record");
-                        }
+                            sheet.write_string(row, col, cell)
+                        };
+                        written.map_err(|e| err("write XLSX record", &e))?;
                     }
                 }
-                workbook.close().expect("Failed to close XLSX workbook");
+                workbook
+                    .save(&self.recording_file_path)
+                    .map_err(|e| err("save XLSX", &e))?;
             }
         }
+        Ok(())
     }
 
     fn format_record_timestamp(&self, record: &super::Record) -> String {
@@ -711,5 +745,48 @@ mod tests {
         assert_eq!(v["status"].as_array().unwrap().len(), 5);
         assert_eq!(v["channels"][1]["name"], "I");
         assert_eq!(v["status"][1]["value"], "CV");
+    }
+
+    fn app_with_recording(
+        format: super::super::RecordingFormat,
+        path: &std::path::Path,
+    ) -> super::super::MyApp {
+        let mut app = super::super::MyApp::default();
+        app.recording_data = vec![dmm_record(), psu_record()];
+        app.recording_format = format;
+        app.recording_file_path = path.to_string_lossy().into_owned();
+        app
+    }
+
+    #[test]
+    fn every_format_writes_a_nonempty_file() {
+        use super::super::RecordingFormat::{Csv, Json, Xlsx};
+        let dir = tempfile::tempdir().unwrap();
+        for (format, name) in [(Csv, "r.csv"), (Json, "r.json"), (Xlsx, "r.xlsx")] {
+            let path = dir.path().join(name);
+            let mut app = app_with_recording(format, &path);
+            app.save_recording_data();
+            assert_eq!(app.recording_error, "", "{name}");
+            assert!(std::fs::metadata(&path).unwrap().len() > 0, "{name}");
+        }
+        // An xlsx file is a zip archive.
+        let head = std::fs::read(dir.path().join("r.xlsx")).unwrap();
+        assert_eq!(&head[..2], b"PK");
+    }
+
+    #[test]
+    fn unwritable_path_reports_instead_of_panicking() {
+        use super::super::RecordingFormat::{Csv, Json, Xlsx};
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("missing_dir").join("r.out");
+        for format in [Csv, Json, Xlsx] {
+            let mut app = app_with_recording(format, &bad);
+            app.save_recording_data();
+            assert!(
+                app.recording_error.starts_with("Save failed"),
+                "{}",
+                app.recording_error
+            );
+        }
     }
 }
