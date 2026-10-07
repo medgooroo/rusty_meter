@@ -246,6 +246,10 @@ mod tests {
             (t.trim().to_owned(), u)
         };
         assert_eq!(f(0.0123, MeterMode::Vdc), ("12.3000".into(), "mVDC".into()));
+        assert_eq!(
+            f(0.04403, MeterMode::Adc),
+            ("44.0300".into(), "mADC".into())
+        );
         assert_eq!(f(4.7e-6, MeterMode::Adc), ("4.70000".into(), "μADC".into()));
         assert_eq!(f(2.5e-9, MeterMode::Per), ("2.50000".into(), "ns".into()));
         assert_eq!(f(1.5e6, MeterMode::Freq), ("1.50000".into(), "MHz".into()));

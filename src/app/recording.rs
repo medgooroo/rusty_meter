@@ -751,11 +751,12 @@ mod tests {
         format: super::super::RecordingFormat,
         path: &std::path::Path,
     ) -> super::super::MyApp {
-        let mut app = super::super::MyApp::default();
-        app.recording_data = vec![dmm_record(), psu_record()];
-        app.recording_format = format;
-        app.recording_file_path = path.to_string_lossy().into_owned();
-        app
+        super::super::MyApp {
+            recording_data: vec![dmm_record(), psu_record()],
+            recording_format: format,
+            recording_file_path: path.to_string_lossy().into_owned(),
+            ..Default::default()
+        }
     }
 
     #[test]

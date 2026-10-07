@@ -1045,12 +1045,15 @@ impl super::MyApp {
                                         None
                                     };
                                     // 86B/C/D: lcd_override. HID: no auto-scale.
-                                    // SCPI: format_measurement(auto_scale).
+                                    // SCPI: always SI-prefixed (mA, kOhm, ...).
                                     // 86E: ON → SI + magnitude auto; OFF → decoder unit (meter range).
                                     let auto_scale = match self.connection_type {
                                         super::ConnectionType::Victor86bcdSerial
                                         | super::ConnectionType::VictorHid => false,
-                                        _ => self.auto_scale_units(&self.metermode),
+                                        super::ConnectionType::Victor86eSerial => {
+                                            self.auto_scale_units(&self.metermode)
+                                        }
+                                        super::ConnectionType::ScpiSerial => true,
                                     };
                                     let (formatted_value, mut display_unit) = {
                                         let use_meter_unit = self.connection_type
@@ -1106,7 +1109,7 @@ impl super::MyApp {
                                     1_000_000.0,
                                     0.000001,
                                     &self.metermode,
-                                    self.auto_scale_units(&self.metermode),
+                                    true,
                                     None,
                                 );
                                 ui.label(
@@ -1266,20 +1269,20 @@ impl super::MyApp {
                                 }
                             }
 
-                            // SI-based meters (SCPI, 86E): same auto-scale control.
-                            // LCD/HID Victors use fixed glass text / no magnitude auto-scale.
-                            let show_auto_scale = match self.connection_type {
-                                #[cfg(not(target_arch = "wasm32"))]
-                                super::ConnectionType::Victor86bcdSerial
-                                | super::ConnectionType::VictorHid => false,
-                                _ => true,
-                            };
+                            // Only the 86E has a choice: SI prefixes, or the meter's own range unit.
+                            // SCPI is always prefixed; LCD/HID Victors show fixed glass text.
+                            #[cfg(not(target_arch = "wasm32"))]
+                            let show_auto_scale =
+                                self.connection_type == super::ConnectionType::Victor86eSerial;
+                            #[cfg(target_arch = "wasm32")]
+                            let show_auto_scale = false;
                             if show_auto_scale {
                                 let mut auto_scale = self.auto_scale_units(&self.metermode);
                                 if ui
-                                    .checkbox(&mut auto_scale, "Auto-scale units")
+                                    .checkbox(&mut auto_scale, "SI prefixes")
                                     .on_hover_text(
-                                        "Auto scale values and show prefixed units like mV/mΩ/kΩ",
+                                        "On: show prefixed units like mV/mA/kΩ.
+Off: use the meter's own range unit.",
                                     )
                                     .changed()
                                 {
